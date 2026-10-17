@@ -1,74 +1,175 @@
 import json
+import math
+import re
+import struct
+import unicodedata
 from pathlib import Path
-import pickle
-from xxhash import xxh32_intdigest
-import math 
-import sys
+import symspellpy
+import xxhash
 
-words_dictionary_bin_path = 'words_dictionary_bloom.bin'
-words_dictionary_path = 'words_dictionary.json'
-extra_hash_seed = 0xCAFEBABE
+SEED1 = 0x9E3779B1          # 2654435761
+SEED2 = 0x85EBCA77          # 2246822519
+EXTRA_HASH_SEED = 0xCAFEBABE  # 3405691582
+MAGIC = b"SPBF"
+HEADER = struct.Struct("<4sBBBBIII")  # magic(4), format(1), k(1), log2m(1), reserved(1), seed1(4), seed2(4), n(4) = 20 bytes
+WORD_RE = re.compile(r"^[a-z]+(?:['-][a-z]+)*$")
+
+BASE_DIR = Path(__file__).resolve().parent
+WORDS_JSON_PATH = BASE_DIR / "words_dictionary.json"
+BLOOM_DIR = BASE_DIR / "bloom"
+BLOOM_BIN_PATH = BLOOM_DIR / "bloom.bin"
+MANIFEST_PATH = BLOOM_DIR / "manifest.json"
+GOLDEN_PATH = BLOOM_DIR / "golden.json"
+FREQ_PATH = BASE_DIR / "freq.txt"
 
 
-def get_hash_indices(word: str, k: int, m: int):
-    word_bytes = word.encode('utf-8')
-    h1 = xxh32_intdigest(word_bytes)
-    indices = []
-    for i in range(k):
-        h2 = xxh32_intdigest(f"{word}{i}{extra_hash_seed}".encode('utf-8'))
-        indices.append((h1 + i * h2) % m)
-    return indices
+def normalize(word: str) -> str:
+    return unicodedata.normalize("NFC", word).replace("\u2019", "'").strip().lower()
+
+
+def get_hash_indices(word: str, k: int, mask: int, seed1: int = SEED1, seed2: int = SEED2) -> list[int]:
+    """Double-hashing: Kirsch-Mitzenmacher optimization using xxHash32."""
+    data = word.encode("utf-8")
+    h1 = xxhash.xxh32_intdigest(data, seed1)
+    h2 = xxhash.xxh32_intdigest(data, seed2) | 1  # Force odd for full cycle coverage
+    return [((h1 + i * h2) & mask) for i in range(k)]
+
+
+def contains(bits: bytes, word: str, k: int, mask: int, seed1: int = SEED1, seed2: int = SEED2) -> bool:
+    indices = get_hash_indices(word, k, mask, seed1, seed2)
+    return all((bits[p >> 3] & (1 << (p & 7))) != 0 for p in indices)
+
+
+def create_frequency_dictionary(words_set: set[str], out_path: Path):
+    """Creates freq.txt merging bundled SymSpell English frequencies with dictionary words."""
+    sym_dir = Path(symspellpy.__file__).parent
+    bundled_freq = sym_dir / "frequency_dictionary_en_82_765.txt"
+    freq_map: dict[str, int] = {}
+
+    if bundled_freq.exists():
+        with open(bundled_freq, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    w, c = parts[0].lower(), int(parts[1])
+                    freq_map[w] = c
+
+    # Add any dictionary words with baseline frequency of 1
+    for w in words_set:
+        if w not in freq_map:
+            freq_map[w] = 1
+
+    # Sort descending by frequency count
+    sorted_words = sorted(freq_map.items(), key=lambda x: -x[1])
+    with open(out_path, "w", encoding="utf-8") as f:
+        for w, c in sorted_words:
+            f.write(f"{w} {c}\n")
+    print(f"Frequency dictionary written to {out_path} ({len(sorted_words):,} words)")
 
 
 def createBloomFilter(data_path: Path):
-    try:
-        with open(data_path, 'r') as f:
-            data = json.load(f)
-        if type(data) != dict or len(data) == 0:
-            raise Exception("Invalid words dictionary")
+    print(f"Reading words from {data_path}...")
+    with open(data_path, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
 
-        n = len(data)
-        p = 0.01
-        m = int((-n * math.log(p) / (math.log(2))**2))
-        k = int((m / n * math.log(2)))
-        bloom_filter = [0] * m
-        for word in data:
-            for index in get_hash_indices(word, k, m):
-                bloom_filter[index] = 1
-        with open(data_path.parent / words_dictionary_bin_path, 'wb') as f:
-            pickle.dump(bloom_filter, f)
-        return n, p, k, m
+    words = []
+    ## consider only normalized words 
+    for key in raw_data.keys():
+        w = normalize(key)
+        if WORD_RE.match(w):
+            words.append(w)
 
-    except Exception as e:
-        print(e)
-        sys.exit(1)
+    words = sorted(set(words))
+    n = len(words)
+    p_target = 0.01
+
+    # bloom filter metrics
+    ideal_m = -n * math.log(p_target) / (math.log(2) ** 2)
+    log2m = max(10, math.ceil(math.log2(ideal_m)))  
+    m = 1 << log2m
+    mask = m - 1
+    k = max(1, min(7, round((m / n) * math.log(2))))
+    fp_expected = (1 - math.exp(-k * n / m)) ** k
+
+    print(f"Building Bloom Filter: n={n:,}, m={m:,} bits (2^{log2m}), k={k}, expected FP={fp_expected:.4%}")
+
+    # space optimization using the bytearray instead of list
+    bits = bytearray(m // 8)
+    for word in words:
+        for pos in get_hash_indices(word, k, mask, SEED1, SEED2):
+            bits[pos >> 3] |= 1 << (pos & 7)
+
+    bits_bytes = bytes(bits)
+
+    # Sanity verify: zero false negatives
+    sample_check = words[:: max(1, n // 500)]
+    assert all(contains(bits_bytes, w, k, mask, SEED1, SEED2) for w in sample_check), "Error: false negative detected!"
+
+    BLOOM_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Write binary bloom filter file with 20-byte header
+    header = HEADER.pack(MAGIC, 1, k, log2m, 0, SEED1, SEED2, n)
+    blob = header + bits_bytes
+    BLOOM_BIN_PATH.write_bytes(blob)
+    print(f"Bloom filter binary written to {BLOOM_BIN_PATH} ({len(blob):,} bytes, ~{len(blob)/1024/1024:.2f} MiB)")
+
+    # 2. manifest.json
+    manifest = {
+        "file": "bloom.bin",
+        "bytes": len(blob),
+        "k": k,
+        "log2m": log2m,
+        "m": m,
+        "n": n,
+        "seed1": SEED1,
+        "seed2": SEED2,
+        "extra_hash_seed": EXTRA_HASH_SEED,
+        "expected_fp": fp_expected,
+    }
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Manifest written to {MANIFEST_PATH}")
+
+    # 3. golden.json test fixture
+    known_set = set(words)
+    present_samples = words[:: max(1, n // 20)][:20]
+    absent_samples = [w for w in ("teh", "recieve", "speling", "definately", "xqzvt", "unvalidwordxyz") if w not in known_set]
+    test_words = present_samples + absent_samples
+
+    cases = [
+        {
+            "word": w,
+            "positions": get_hash_indices(w, k, mask, SEED1, SEED2),
+            "present": contains(bits_bytes, w, k, mask, SEED1, SEED2),
+        }
+        for w in test_words
+    ]
+
+    golden_data = {
+        "k": k,
+        "mask": mask,
+        "seed1": SEED1,
+        "seed2": SEED2,
+        "extra_hash_seed": EXTRA_HASH_SEED,
+        "cases": cases,
+    }
+    GOLDEN_PATH.write_text(json.dumps(golden_data, indent=2), encoding="utf-8")
+    print(f"Golden vectors written to {GOLDEN_PATH}")
+
+    # 4. Generate frequency dictionary for SymSpell
+    create_frequency_dictionary(known_set, FREQ_PATH)
+
+    return manifest
 
 
 def bloomFilterStartUp():
-    try:
-        base_dir = Path(__file__).resolve().parent
-        wd_bin_path = base_dir / words_dictionary_bin_path
-        wd_path = base_dir / words_dictionary_path
-        if not wd_path.exists():
-            raise Exception("Words dictionary json file not found")
-        else:
-            if not wd_bin_path.exists():
-                print("Creating Bloom filter from dictionary...")
-                capacity, false_positive_probability, no_of_hash_functions, bloom_fliter_size = createBloomFilter(wd_path)
-                print(f"Bloom filter created successfully: capacity={capacity}, p={false_positive_probability}, k={no_of_hash_functions}, size={bloom_fliter_size}")
-                return capacity, false_positive_probability, no_of_hash_functions, bloom_fliter_size
-            else:
-                with open(wd_bin_path, 'rb') as f:
-                    bloom_filter = pickle.load(f)
-                if type(bloom_filter) != list or len(bloom_filter) == 0:
-                    raise Exception("Invalid bloom filter")
-                print(f"Bloom filter loaded successfully ({len(bloom_filter)} bits).")
-                return bloom_filter
-
-    except Exception as e:
-        print(e)
-        sys.exit(1)
+    if not BLOOM_BIN_PATH.exists() or not MANIFEST_PATH.exists() or not FREQ_PATH.exists():
+        print("Bloom filter or frequency files missing. Generating now...")
+        return createBloomFilter(WORDS_JSON_PATH)
+    else:
+        print(f"Bloom filter files exist in {BLOOM_DIR}.")
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        return manifest
 
 
 if __name__ == "__main__":
-    bloomFilterStartUp()
+    createBloomFilter(WORDS_JSON_PATH)
