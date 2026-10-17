@@ -11,7 +11,7 @@ const STORAGE_KEY = "sc_bloom_notepad_text";
 
 const SAMPLE_TEXT = `Welcome to the Bloom Filter Spell Checker demo!
 
-Try right-clicking any wavy-underlined word to get instant SymSpell suggestions.
+Try right clicking any underlined word to get instant suggestions.
 
 Here are a few deliberate typos to test:
 - Can you please recieve the package tomorrow?
